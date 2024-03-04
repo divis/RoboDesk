@@ -1,3 +1,9 @@
+/**
+ * @Author: Lukas Prokop
+ * @Date:   2024-03-04 11:01:01
+ * @Last Modified by:   Lukas Prokop
+ * @Last Modified time: 2024-03-04 11:38:03
+ */
 // Inspired by https://github.com/dhylands/Arduino-logging-library
 
 #include <Logging.h>

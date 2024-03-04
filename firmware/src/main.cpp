@@ -1,3 +1,10 @@
+/**
+ * @Author: Lukas Prokop
+ * @Date:   2024-03-04 11:01:01
+ * @Last Modified by:   Lukas Prokop
+ * @Last Modified time: 2024-03-04 20:13:33
+ */
+
 #include <pins.h> // rename pins.h.example and adjust pins
 #include <LogicData.h>
 #include <ESP8266WiFi.h>
