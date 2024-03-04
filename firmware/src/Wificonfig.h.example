@@ -1,9 +1,0 @@
-#ifndef WIFICONFIG_H
-#define WIFICONFIG_H
-
-IPAddress WIFI_IP(192, 168, 1, 222);
-IPAddress WIFI_GATEWAY(192, 168, 1, 1);
-IPAddress WIFI_SUBNET(255, 255, 255, 0);
-IPAddress WIFI_DNS(192, 168, 1, 1); 
-
-#endif // WIFICONFIG_H
