@@ -2,7 +2,7 @@
  * @Author: Lukas Prokop
  * @Date:   2024-03-04 11:01:01
  * @Last Modified by:   Lukas Prokop
- * @Last Modified time: 2024-03-04 20:13:33
+ * @Last Modified time: 2024-03-24 11:44:08
  */
 
 #include <pins.h> // rename pins.h.example and adjust pins
@@ -12,11 +12,14 @@
 #include <ArduinoOTA.h>
 #include <Credentials.h> // rename Credential.h.example and adjust variables
 #include <Logging.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerial.h>
 
-uint8_t highTarget = 125;
-uint8_t lowTarget = 88;
-uint8_t maxHeight = 128; //maxHeight table = 128, but you may set a custom min
-uint8_t minHeight = 78; //minHeight table = 62, but you may set a custom min
+uint8_t highTarget = 110; //116
+uint8_t lowTarget = 80;
+uint8_t maxHeight = 114; //maxHeight table = 128, but you may set a custom min
+uint8_t minHeight = 70; //minHeight table = 62, but you may set a custom min
 
 const uint32_t debounce_time = 50;
 const uint32_t double_time = 500;
@@ -49,6 +52,8 @@ bool setHeight = false;
 enum Directions { UP, DOWN, STOPPED };
 Directions direction = STOPPED;
 bool mqttLog = false;
+
+AsyncWebServer server(80);
 
 #pragma region Helpers
 
@@ -118,6 +123,10 @@ void check_display() {
     uint32_t now = millis();
     sprintf(buf, "%6ums %s: %s", now - prev, logicData.MsgType(msg), logicData.Decode(msg));
     Log.Debug("%s" CR, buf);
+    WebSerial.print("Buffer: ");
+    WebSerial.println(buf);
+    WebSerial.print("Message: ");
+    WebSerial.println(msg);
     log(msg);
     prev=now;
   }
@@ -173,6 +182,7 @@ void move_table(Directions tmpDirection) {
     }
   } else if (!isValidHeight(currentHeight, tmpDirection)) {
     Log.Error("Non valid height [%d] received. Stopping table." CR, currentHeight);
+    WebSerial.println("Non valid height [" + String(currentHeight) + "] received. Stopping table.");
     stop_table();
   }
 }
@@ -194,6 +204,7 @@ void move_table_to_fixed(Directions highLowTarget) {
               highLowTarget == UP ? "High" : "Low",
               targetHeight,
               currentHeight);
+    WebSerial.println("Setting height. Target: " + String(targetHeight) + " cm. Current height: " + String(currentHeight) + " cm.");
 }
 
 /**
@@ -207,6 +218,7 @@ void move() {
     //both buttons pressed, do nothing
     //TODO: Save position to EEPROM like https://github.com/talsalmona/RoboDesk/blob/master/RoboDesk.ino
     Log.Debug("Both buttons pressed" CR);
+    WebSerial.println("Both buttons pressed.");
   } else if(btn_last_state[0]) {
     //left button pressed
     move_table(UP);
@@ -218,6 +230,7 @@ void move() {
   } else if (!setHeight) {
     if( direction != STOPPED) {
       Log.Info("button [%s] press stopped. Current height: %d cm" CR, direction == UP ? "up" : "down", currentHeight);
+      WebSerial.println("button [" + String(direction == UP ? "up" : "down") + "] press stopped. Current height: " + String(currentHeight) + " cm.");
       stop_table();
     }
     return;
@@ -240,6 +253,7 @@ void move() {
     }
   } else {
     Log.Info("Hit target height: %d cm" CR, targetHeight);
+    WebSerial.println("Hit target height: " + String(targetHeight) + " cm.");
     stop_table();
     return;
   }
@@ -261,13 +275,17 @@ void mqtt_callCmd(String message) {
       else
         mqttLog = false;
       Log.Debug("%s MQTT Logging" CR, mqttLog ? "Activated" : "Deactivated");
+      WebSerial.println("MQTT Logging: " + mqttLog ? "Activated" : "Deactivated");
       //TODO: Here be dragons - actually implement mqtt logging
     } else if (message == "up") {
         move_table_to_fixed(UP);
+        WebSerial.println("MQTT: Received up. Current height: " + String(currentHeight) + " cm.");
     } else if (message == "down") {
         move_table_to_fixed(DOWN);
+        WebSerial.println("MQTT: Received down. Current height: " + String(currentHeight) + " cm.");
     } else if (message == "stop") {
         Log.Info("MQTT: Received stop. Current height: %d cm" CR, currentHeight);
+        WebSerial.println("MQTT: Received stop. Current height: " + String(currentHeight) + " cm.");
         stop_table();
     } else if (message == "ping") {
         // we do want some kind of test message to see if things work
@@ -289,9 +307,11 @@ void mqtt_callSet(byte* message, int length) {
       setHeight = true;
     } else {
       Log.Error("Invalid height: %d! [min: %d cm, max: %d cm]" CR, height_in, minHeight, maxHeight);
+      WebSerial.println("Invalid height: " + String(height_in) + "! [min: " + String(minHeight) + " cm, max: " + String(maxHeight) + " cm]");
     }
     
     Log.Info("Setting height. Target: %d cm. Current height: %d cm" CR, targetHeight, currentHeight);
+    WebSerial.println("Setting height. Target: " + String(targetHeight) + " cm. Current height: " + String(currentHeight) + " cm.");
 }
 
 /**
@@ -394,7 +414,7 @@ void setup_mqtt() {
   mqttClient.setCallback(mqtt_callback);
 }
 
-void init_mqtt() {
+void init_mqtt() {  
   if (!mqttClient.connected()) {
       while (!mqttClient.connected()) {
           if (mqttClient.connect(HOSTNAME,
@@ -407,6 +427,7 @@ void init_mqtt() {
             mqttClient.subscribe((MQTT_TOPIC + "cmd").c_str());
           }
           delay(100);
+          Log.Info("MQTT: Connected! [%s]" CR, HOSTNAME);
       }
   } else
     mqttClient.loop();
@@ -442,6 +463,10 @@ void setup() {
 
   // we use this just to get an initial height on startup (otherwise height is 0)
   move_table(UP);
+
+  // WebSerial is accessible at "<IP Address>/webserial" in browser
+  WebSerial.begin(&server);
+  server.begin();
 }
 
 void loop() {
@@ -464,15 +489,18 @@ void loop() {
         if(millis() - btn_last_on[i] < double_time) {
           //double press
           Log.Info("button [%s] press (double)" CR, i == 0 ? "up" : "down");
+          WebSerial.println("button [" + String(i == 0 ? "up" : "down") + "] press (double)");
           mqttClient.publish((MQTT_TOPIC + "button").c_str(), i == 0 ? "double up" : "double down");
           move_table_to_fixed(i == 0 ? UP : DOWN);
         } else {
           btn_last_on[i] = debounce[i];
           //single press
           Log.Info("button [%s] press" CR, i == 0 ? "up" : "down");
+          WebSerial.println("button [" + String(i == 0 ? "up" : "down") + "] press");
           mqttClient.publish((MQTT_TOPIC + "button").c_str(), i == 0 ? "single up" : "single down");
           if (setHeight) {
             Log.Info("Setting height end." CR);
+            WebSerial.println("Setting height end.");
             setHeight = false;
           }
         }

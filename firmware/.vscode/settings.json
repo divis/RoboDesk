@@ -1,0 +1,12 @@
+{
+    "vsmqtt.brokerProfiles": [
+        {
+            "name": "nas.local",
+            "host": "192.168.54.21",
+            "port": 1884,
+            "clientId": "vsmqtt_client_b608",
+            "username": "prokop",
+            "password": "Af3N@y45&3S#J9Z@"
+        }
+    ]
+}
