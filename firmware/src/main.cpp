@@ -2,7 +2,7 @@
  * @Author: Lukas Prokop
  * @Date:   2024-03-04 11:01:01
  * @Last Modified by:   Lukas Prokop
- * @Last Modified time: 2024-03-24 11:44:08
+ * @Last Modified time: 2024-03-25 14:25:20
  */
 
 #include <pins.h> // rename pins.h.example and adjust pins
@@ -11,10 +11,8 @@
 #include <PubSubClient.h>
 #include <ArduinoOTA.h>
 #include <Credentials.h> // rename Credential.h.example and adjust variables
-#include <Logging.h>
-#include <ESPAsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <WebSerial.h>
+#include <ArduinoJson.h>
+#include <RemoteDebug.h>
 
 uint8_t highTarget = 110; //116
 uint8_t lowTarget = 80;
@@ -39,9 +37,11 @@ uint32_t last_signal = 0;
 uint32_t signal_giveup_time = 2000;
 
 long lastPublish = 0;
+long lastPublishHASS = 0;
+bool discoveryPublished = false;
 uint8_t publishedHeight = 0;
 
-const char* versionLine = "Robodesk v3.0  build: " __DATE__ " " __TIME__;
+const char* versionLine = "SmartDesk v0.2 build: " __DATE__ " " __TIME__;
 LogicData logicData(-1);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -51,29 +51,23 @@ uint8_t targetHeight;
 bool setHeight = false;
 enum Directions { UP, DOWN, STOPPED };
 Directions direction = STOPPED;
-bool mqttLog = false;
+// uptime in miliseconds
+uint32_t uptime = 0;
 
-AsyncWebServer server(80);
+#ifndef ESP8266 
+  #define ESP8266
+#endif
 
-#pragma region Helpers
+// #define DEBUG_ACTIVE
 
-template <class T>
-/**
- * @brief Converts anything to char *
- * 
- * @param value 
- * @return char* 
- */
-char * convertToChar (T value) {
-    String valueString = String(value);
-    char * output = new char[valueString.length() +1];
-    strcpy(output,valueString.c_str());
-    return output;
-}
-int convertCharToInt (char* value, int length) {
-  value[length] = '\0';
-  return atoi(value);
-}
+RemoteDebug Debug;
+#ifdef DEBUG_ACTIVE
+  bool debug = true;  
+#else
+  bool debug = false;
+#endif
+
+/* Helpers */
 
 /**
  * @brief checks if passed height is within allowed range
@@ -98,9 +92,50 @@ bool isValidHeight(int checkHeight, Directions direction = STOPPED) {
   }
 }
 
-#pragma endregion
+/* Logging helpers */
 
-#pragma region Logicdata related
+/**
+ * @brief Logs the message to the serial and mqtt
+ *
+ * @param message - the message to log
+ */
+void logItE(const char *format, ...)
+{
+  va_list args;
+  va_start(args, format);
+  char buf[256];
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  debugI("ERROR: %s", buf);
+  mqttClient.publish((MQTT_TOPIC + "info").c_str(), buf);
+}
+
+void logItI(const char *format, ...)
+{
+  va_list args;
+  va_start(args, format);
+  char buf[256];
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  debugI("INFO: %s", buf);
+  mqttClient.publish((MQTT_TOPIC + "info").c_str(), buf);
+}
+
+void logItD(const char *format, ...)
+{
+  if (debug)
+  {
+    va_list args;
+    va_start(args, format);
+    char buf[256];
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    debugI("DEBUG: %s", buf);
+    // mqttClient.publish((MQTT_TOPIC + "info").c_str(), buf);
+  }
+}
+
+/* Logicdata related */
 
 /**
  * @brief Buffered mode parses input words and sends them to output separately
@@ -122,11 +157,7 @@ void check_display() {
   if (msg) {
     uint32_t now = millis();
     sprintf(buf, "%6ums %s: %s", now - prev, logicData.MsgType(msg), logicData.Decode(msg));
-    Log.Debug("%s" CR, buf);
-    WebSerial.print("Buffer: ");
-    WebSerial.println(buf);
-    WebSerial.print("Message: ");
-    WebSerial.println(msg);
+    logItD("Buffer: %s", buf);
     log(msg);
     prev=now;
   }
@@ -143,9 +174,8 @@ void check_display() {
     last_signal = millis();
 }
 
-#pragma endregion
 
-#pragma region Table Movement
+/* Table Movement */
 
 /**
  * @brief Stops the table and resets variables
@@ -181,8 +211,7 @@ void move_table(Directions tmpDirection) {
       direction = tmpDirection;
     }
   } else if (!isValidHeight(currentHeight, tmpDirection)) {
-    Log.Error("Non valid height [%d] received. Stopping table." CR, currentHeight);
-    WebSerial.println("Non valid height [" + String(currentHeight) + "] received. Stopping table.");
+    logItE("Non valid height [%d] received. Stopping table.", currentHeight, "e");
     stop_table();
   }
 }
@@ -200,11 +229,7 @@ void move_table_to_fixed(Directions highLowTarget) {
     else if (highLowTarget == DOWN)
       targetHeight = lowTarget;
 
-    Log.Info("Start setting height. %s target: %d cm. Current height: %d cm." CR,
-              highLowTarget == UP ? "High" : "Low",
-              targetHeight,
-              currentHeight);
-    WebSerial.println("Setting height. Target: " + String(targetHeight) + " cm. Current height: " + String(currentHeight) + " cm.");
+    logItI("Start setting height. %s target: %d cm. Current height: %d cm.", highLowTarget == UP ? "High" : "Low", targetHeight, currentHeight);
 }
 
 /**
@@ -217,8 +242,7 @@ void move() {
   if(btn_last_state[0] && btn_last_state[1]) {
     //both buttons pressed, do nothing
     //TODO: Save position to EEPROM like https://github.com/talsalmona/RoboDesk/blob/master/RoboDesk.ino
-    Log.Debug("Both buttons pressed" CR);
-    WebSerial.println("Both buttons pressed.");
+    logItD("Both buttons pressed");
   } else if(btn_last_state[0]) {
     //left button pressed
     move_table(UP);
@@ -229,15 +253,14 @@ void move() {
     return;
   } else if (!setHeight) {
     if( direction != STOPPED) {
-      Log.Info("button [%s] press stopped. Current height: %d cm" CR, direction == UP ? "up" : "down", currentHeight);
-      WebSerial.println("button [" + String(direction == UP ? "up" : "down") + "] press stopped. Current height: " + String(currentHeight) + " cm.");
+      logItI("button [%s] press stopped. Current height: %d cm", direction == UP ? "up" : "down", currentHeight);
       stop_table();
     }
     return;
   }
 
   if((millis() - last_signal > signal_giveup_time) && !setHeight) {
-    Log.Error("Haven't seen input in a while, turning everything off for safety" CR);
+    logItE("Haven't seen input in a while, turning everything off for safety");
     stop_table();
     while(true) ;
   }
@@ -252,113 +275,280 @@ void move() {
       return;
     }
   } else {
-    Log.Info("Hit target height: %d cm" CR, targetHeight);
-    WebSerial.println("Hit target height: " + String(targetHeight) + " cm.");
+    logItI("Hit target height: %d cm", targetHeight);
     stop_table();
     return;
   }
 }
 
-#pragma endregion
-
-#pragma region MQTT functions
+/* MQTT functions */
 
 /**
- * @brief Callback function on receiving a command
- * 
- * @param message is checked to correspond to prexisting commands
+ * @brief Sets the device information in the JSON document
+ *
+ * @param doc - the JSON document
  */
-void mqtt_callCmd(String message) {
-    if (message == "debug") {
-      if (mqttLog == false)
-        mqttLog = true;
-      else
-        mqttLog = false;
-      Log.Debug("%s MQTT Logging" CR, mqttLog ? "Activated" : "Deactivated");
-      WebSerial.println("MQTT Logging: " + mqttLog ? "Activated" : "Deactivated");
-      //TODO: Here be dragons - actually implement mqtt logging
-    } else if (message == "up") {
-        move_table_to_fixed(UP);
-        WebSerial.println("MQTT: Received up. Current height: " + String(currentHeight) + " cm.");
-    } else if (message == "down") {
-        move_table_to_fixed(DOWN);
-        WebSerial.println("MQTT: Received down. Current height: " + String(currentHeight) + " cm.");
-    } else if (message == "stop") {
-        Log.Info("MQTT: Received stop. Current height: %d cm" CR, currentHeight);
-        WebSerial.println("MQTT: Received stop. Current height: " + String(currentHeight) + " cm.");
-        stop_table();
-    } else if (message == "ping") {
-        // we do want some kind of test message to see if things work
-        Log.Debug("MQTT: pong. Current height: %d cm" CR, currentHeight);
-        mqttClient.publish((MQTT_TOPIC + "cmd").c_str(), "pong");
-    }
+void setJsonDevice(JsonDocument &doc) {
+  String macAddress = WiFi.macAddress();
+  macAddress.replace(":", "_"); // Replace colons with underscores
+  String unique_id = "table_" + macAddress;
+  String main_topic = MQTT_TOPIC.substring(0, MQTT_TOPIC.length() - 1);
+
+  doc["device"]["identifiers"] = unique_id;
+  doc["device"]["name"] = main_topic;
+  doc["device"]["manufacturer"] = "Lukas Prokop";
+  doc["device"]["sw_version"] = versionLine;
+  doc["device"]["model"] = "SmartDesk Table ESP8266";
+  doc["device"]["hw_version"] = "1.0";
 }
 
 /**
- * @brief Callback function on receiving a height
- * 
- * @param message must be an int, needs to be within height range
- * @param length message length
+ * @brief Creates and publish the discovery message for Home Assistant
+ *
+ * @param field - the field to publish
+ * @param name - the name of the field
+ * @param icon - the icon to use
+ * @param unit - the unit of measurement
+ * @param deviceClass - the device class
+ * @param stateClass - the state class
+ * @param entityCategory - the entity category
  */
-void mqtt_callSet(byte* message, int length) {
-    int height_in = convertCharToInt((char* )message, length);
-    if (isValidHeight(height_in)) {
-      targetHeight = height_in;
-      setHeight = true;
-    } else {
-      Log.Error("Invalid height: %d! [min: %d cm, max: %d cm]" CR, height_in, minHeight, maxHeight);
-      WebSerial.println("Invalid height: " + String(height_in) + "! [min: " + String(minHeight) + " cm, max: " + String(maxHeight) + " cm]");
-    }
-    
-    Log.Info("Setting height. Target: %d cm. Current height: %d cm" CR, targetHeight, currentHeight);
-    WebSerial.println("Setting height. Target: " + String(targetHeight) + " cm. Current height: " + String(currentHeight) + " cm.");
+void publishSensorDiscoveryToHASS(String field, String name, String icon, String unit, String deviceClass, String stateClass, String entityCategory)
+{
+  JsonDocument doc;
+  String output;
+  String hass_topic = "homeassistant/sensor/table-" + field + "/config";
+  String main_topic = MQTT_TOPIC.substring(0, MQTT_TOPIC.length() - 1);
+
+  // check that input params are not empty
+  if (field == "" || name == "")
+  {
+    logItE("ERROR: Missing input parameters for discovery message!");
+    return;
+  }
+
+  doc["~"] = main_topic;
+  doc["name"] = name;
+  doc["unique_id"] = main_topic + "-" + field;
+  doc["object_id"] = main_topic + "_" + field;
+  doc["state_topic"] = "~/" + field;
+  if (icon != "")
+    doc["icon"] = "mdi:" + icon;
+  // doc["value_template"] = "{{ value_json." + field + " }}";
+  if (unit != "")
+    doc["unit_of_measurement"] = unit;
+  if (deviceClass != "")
+    doc["device_class"] = deviceClass;
+  if (stateClass != "")
+    doc["state_class"] = stateClass;
+  if (entityCategory != "")
+    doc["entity_category"] = entityCategory;
+
+  doc["availability_topic"] = "~/status";
+  doc["payload_available"] = "ON";
+  doc["payload_not_available"] = "OFF";
+
+  setJsonDevice(doc);
+  serializeJson(doc, output);
+  mqttClient.publish(hass_topic.c_str(), output.c_str());
+  logItD("Published -> Topic: %s\nMessage: %s", hass_topic, output);
+}
+
+// Publish switch discovery message to Home Assistant
+void publishButtonDiscoveryToHASS(String field, String name, String icon, String deviceClass = "button") {
+  JsonDocument doc;
+  String output;
+  String hass_topic = "homeassistant/" + deviceClass + "/table-" + field + "/config";
+  String main_topic = MQTT_TOPIC.substring(0, MQTT_TOPIC.length() - 1);
+
+  // check that input params are not empty
+  if (field == "" || name == "")
+  {
+    logItE("ERROR: Missing input parameters for discovery message!");
+    return;
+  }
+
+  doc["~"] = main_topic;
+  doc["name"] = name;
+  doc["unique_id"] = main_topic + "-" + field;
+  doc["object_id"] = main_topic + "_" + field;
+  if (icon != "")
+    doc["icon"] = "mdi:" + icon;
+  doc["command_topic"] = "~/set";
+  doc["payload_press"] = "{\"cmd\":\"" + field + "\"}";
+  doc["assume_state"] = true;
+
+  setJsonDevice(doc);  
+  serializeJson(doc, output);
+  mqttClient.publish(hass_topic.c_str(), output.c_str());
+  logItD("Published -> Topic: %s\nMessage: %s", hass_topic, output);
 }
 
 /**
- * @brief Default MQTT callback function returning everything that is sent to subscribed topics
- *        also takes care of sending messages to dedicated callback functions if necessary
- * 
- * @param topic subscribed topic the message was received on
- * @param message 
- * @param length message length
+ * @brief Publishes the discovery messages to Home Assistant - helper function
+ *
  */
-void mqtt_callback(char* topic, byte* message, unsigned int length) {
-  Log.Debug("MQTT: Topic: %s. Message [%d]: ", topic, length);
-  String messageTemp;
-  
-  for (unsigned int i = 0; i < length; i++) {
-    Log.Debug("%C", message[i]);
-    messageTemp += (char)message[i];
-  }
-  Log.Debug(CR);
+void publishDiscovery()
+{
+  publishSensorDiscoveryToHASS("height", "Height", "table", "cm", "distance", "measurement", "");
+  publishSensorDiscoveryToHASS("state", "State", "power", "", "", "", "diagnostic");
+  publishSensorDiscoveryToHASS("uptime", "Uptime", "clock", "s", "", "", "diagnostic");
+  publishSensorDiscoveryToHASS("MAC", "MAC Address", "network-outline", "", "", "", "diagnostic");
+  publishSensorDiscoveryToHASS("IP", "IP Address", "network-outline", "", "", "", "diagnostic");
+  publishSensorDiscoveryToHASS("hostname", "Hostname", "network-outline", "", "", "", "diagnostic");
+  publishSensorDiscoveryToHASS("wifiRSSI", "WiFi RSSI", "wifi", "dBm", "signal_strength", "", "diagnostic");
+  publishSensorDiscoveryToHASS("SSID", "SSID", "network-outline", "", "", "", "diagnostic");
+  logItI("MQTT: Published sensor discovery messages to Home Assistant. [height, state, uptime, MAC, IP, hostname, wifiRSSI, SSID]");
+  publishButtonDiscoveryToHASS("up", "Move Up", "arrow-up", "button");
+  publishButtonDiscoveryToHASS("down", "Move Down", "arrow-down", "button");
+  publishButtonDiscoveryToHASS("stop", "Stop", "stop", "button");
+  logItI("MQTT: Published switch discovery messages to Home Assistant. [up, down, stop]");
+}
 
-  if ((String) topic == MQTT_TOPIC + "set") {
-    mqtt_callSet(message, length);
+void clearDiscoveryAll() {
+  String hass_topic;
+
+  String sensor_topics[] = {"height", "state", "uptime", "MAC", "IP", "hostname", "wifiRSSI", "SSID"};
+  String button_topics[] = {"up", "down", "stop"};
+
+  for (unsigned i = 0; i < ARRAY_SIZE(sensor_topics); i++) {
+    hass_topic = "homeassistant/sensor/table-" + sensor_topics[i] + "/config";
+    mqttClient.publish(hass_topic.c_str(), "");
+    logItI("MQTT: Cleared discovery message for %s", hass_topic);
   }
 
-  if ((String) topic == MQTT_TOPIC + "cmd") {
-    mqtt_callCmd(messageTemp);
+  for (unsigned i = 0; i < ARRAY_SIZE(button_topics); i++) {
+    hass_topic = "homeassistant/button/table-" + button_topics[i] + "/config";
+    mqttClient.publish(hass_topic.c_str(), "");
+    logItI("MQTT: Cleared discovery message for %s", hass_topic);
   }
+}
+
+/**
+ * @brief Publishes the initial status to Home Assistant
+ *
+ */
+void publishTopicsForHASS()
+{
+  mqttClient.publish((MQTT_TOPIC + "status").c_str(), "ON");
+  mqttClient.publish((MQTT_TOPIC + "MAC").c_str(), WiFi.macAddress().c_str());
+  mqttClient.publish((MQTT_TOPIC + "IP").c_str(), WiFi.localIP().toString().c_str());
+  mqttClient.publish((MQTT_TOPIC + "hostname").c_str(), HOSTNAME);
+  mqttClient.publish((MQTT_TOPIC + "SSID").c_str(), WiFi.SSID().c_str());
+  lastPublishHASS = millis();
+}
+
+/**
+ * @brief Publish status to home assistant every 60 seconds
+ * 
+ */
+void publishTopicsForHASSRepeat()
+{
+  if (!discoveryPublished) {
+    publishDiscovery();
+    publishTopicsForHASS();
+    discoveryPublished = true;
+  }
+  if (millis() - lastPublishHASS > 60000) {    
+    mqttClient.publish((MQTT_TOPIC + "uptime").c_str(), String(millis()/1000).c_str());
+    mqttClient.publish((MQTT_TOPIC + "wifiRSSI").c_str(), String(WiFi.RSSI()).c_str());
+    lastPublishHASS = millis();
+  }  
 }
 
 /**
  * @brief Takes care of publishingt the current height if it hasn't been published in a
  *        certain amount of time
- * 
+ *
  */
-void mqtt_publishHeight() {
-    long now = millis();
-    if (publishedHeight != currentHeight && now - lastPublish > 2000)
-    {
-        lastPublish = now;
-        publishedHeight = currentHeight;
-        mqttClient.publish((MQTT_TOPIC + "height").c_str(), convertToChar(currentHeight));
-    }
+void mqtt_publishHeight()
+{
+  long now = millis();
+  if (publishedHeight != currentHeight && now - lastPublish > 2000)
+  {
+    lastPublish = now;
+    publishedHeight = currentHeight;
+    mqttClient.publish((MQTT_TOPIC + "height").c_str(), String(currentHeight).c_str());
+  }
 }
 
-#pragma endregion
+/**
+ * @brief Callback function on receiving a command
+ *
+ * @param length message length
+ * @param topic the topic the message was received on
+ * @param messageBytes the message as bytes
+ */
+void mqtt_callback(char *topic, byte *payload, unsigned int length)
+{
+  if (length == 0) {
+    logItD("MQTT: No message received.");
+    return;
+  }
 
-#pragma region Setup: Wifi, OTA, MQTT
+  JsonDocument doc;
+  String message = String((char *)payload);
+  
+  DeserializationError error = deserializeJson(doc, payload);
+  int height = 0;
+  
+  if (error) {
+    logItE("MQTT: Error parsing JSON: %s", String(error.c_str()));
+    return;
+  }
+
+  if (doc.containsKey("debug"))
+  {
+    debug = doc["debug"].as<bool>();
+    logItD("MQTT: Debug set to %s.", debug ? "true" : "false");
+  }
+  
+  
+  if (doc.containsKey("cmd")) {
+    String cmd = doc["cmd"].as<String>();
+    if (cmd == "height") {
+      if (!doc.containsKey("height")) {
+        logItE("ERROR: No height provided!");
+        return;
+      }
+      
+      height = doc["height"].as<int>();
+      if (isValidHeight(height))
+      {
+        targetHeight = height;
+        setHeight = true;
+        logItI("Setting height to %d cm.", height);
+      }
+      else
+      {
+        logItE("ERROR: Invalid height: %d ! [min: %d cm, max: %d cm]", height, minHeight, maxHeight);
+      }
+    }
+    else if (cmd == "up") {
+      move_table_to_fixed(UP);
+      logItD("MQTT: Received up. Current height: %d cm.", currentHeight);
+    }
+    else if (cmd == "down") {
+      move_table_to_fixed(DOWN);
+      logItD("MQTT: Received down. Current height: %d cm.", currentHeight);
+    }
+    else if (cmd == "stop") {
+      logItD("MQTT: Received stop. Current height: %d cm.", currentHeight);
+      stop_table();
+    }
+    else if (cmd == "publish_discovery") {
+      publishDiscovery();
+    }
+    else if (cmd == "clear_discovery") {
+      clearDiscoveryAll();
+    }
+    else {
+      logItE("MQTT: Unknown command: %s", cmd.c_str());
+    }
+  }
+}
+
+/* Setup: Wifi, OTA, MQTT */
 
 void setup_wifi() {
     WiFi.mode(WIFI_STA);
@@ -373,7 +563,7 @@ void setup_wifi() {
     while (WiFi.status() != WL_CONNECTED) {
         delay(100);
     }
-    Log.Info("WiFi: Connected! IP: %s" CR, (WiFi.localIP().toString().c_str()));
+    logItI("WiFi: Connected! IP: %s", (WiFi.localIP().toString().c_str()));
 }
 
 void setup_OTA() {
@@ -385,26 +575,26 @@ void setup_OTA() {
       type = "filesystem";
 
     // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-    Log.Info("Start updating %s" CR, type);
+    logItI("Start updating %s", type);
   });
   ArduinoOTA.onEnd([]() {
-    Log.Info(CR "End" CR);
+    logItI("End");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Log.Info("Progress: %d%%\n", (progress / (total / 100)));
+    logItI("Progress: %d%%\n", (progress / (total / 100)));
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    Log.Error("Error[%d]: ", error);
+    logItE("Error[%d]: ", error);
     if (error == OTA_AUTH_ERROR)
-      Log.Error("Auth Failed" CR);
+      logItE("Auth Failed");
     else if (error == OTA_BEGIN_ERROR)
-      Log.Error("Begin Failed" CR);
+      logItE("Begin Failed");
     else if (error == OTA_CONNECT_ERROR)
-      Log.Error("Connect Failed" CR);
+      logItE("Connect Failed");
     else if (error == OTA_RECEIVE_ERROR)
-      Log.Error("Receive Failed" CR);
+      logItE("Receive Failed");
     else if (error == OTA_END_ERROR)
-      Log.Error("End Failed" CR);
+      logItE("End Failed");
   });
   ArduinoOTA.begin();
 }
@@ -414,6 +604,10 @@ void setup_mqtt() {
   mqttClient.setCallback(mqtt_callback);
 }
 
+/**
+ * @brief Initializes the mqtt connection
+ * 
+ */
 void init_mqtt() {  
   if (!mqttClient.connected()) {
       while (!mqttClient.connected()) {
@@ -424,16 +618,14 @@ void init_mqtt() {
               true,
               versionLine)) {
             mqttClient.subscribe((MQTT_TOPIC + "set").c_str());
-            mqttClient.subscribe((MQTT_TOPIC + "cmd").c_str());
           }
           delay(100);
-          Log.Info("MQTT: Connected! [%s]" CR, HOSTNAME);
+          logItI("MQTT: Connected! [%s]", HOSTNAME);
       }
   } else
     mqttClient.loop();
 }
 
-#pragma endregion
 
 void setup() {
 
@@ -446,9 +638,8 @@ void setup() {
   pinMode(ASSERT_UP, OUTPUT);
   pinMode(ASSERT_DOWN, OUTPUT);
 
-  Log.Init(LOG_LEVEL_DEBUG, 115200L);
-  Log.Info(CR "---------" CR);
-  Log.Info("%s" CR, versionLine);
+  logItI("---------");
+  logItI("%s", versionLine);
 
   setup_wifi();
   setup_OTA();
@@ -459,14 +650,19 @@ void setup() {
 
   logicData.Begin();
 
-  Log.Info("---------" CR);
+  logItI("---------");
 
   // we use this just to get an initial height on startup (otherwise height is 0)
   move_table(UP);
 
-  // WebSerial is accessible at "<IP Address>/webserial" in browser
-  WebSerial.begin(&server);
-  server.begin();
+  if (debug) {
+    // RemoteDebug
+    Debug.begin(HOSTNAME);
+    Debug.showTime(true);
+    Debug.setResetCmdEnabled(false);
+    // Debug.setCallBackProjectCmds(callback);
+    Debug.setSerialEnabled(true);
+  }
 }
 
 void loop() {
@@ -488,19 +684,14 @@ void loop() {
       if(btn_last_state[i]) {
         if(millis() - btn_last_on[i] < double_time) {
           //double press
-          Log.Info("button [%s] press (double)" CR, i == 0 ? "up" : "down");
-          WebSerial.println("button [" + String(i == 0 ? "up" : "down") + "] press (double)");
-          mqttClient.publish((MQTT_TOPIC + "button").c_str(), i == 0 ? "double up" : "double down");
+          logItI("button [%s] press (double)", i == 0 ? "up" : "down");
           move_table_to_fixed(i == 0 ? UP : DOWN);
         } else {
           btn_last_on[i] = debounce[i];
           //single press
-          Log.Info("button [%s] press" CR, i == 0 ? "up" : "down");
-          WebSerial.println("button [" + String(i == 0 ? "up" : "down") + "] press");
-          mqttClient.publish((MQTT_TOPIC + "button").c_str(), i == 0 ? "single up" : "single down");
+          logItI("button [%s] press", i == 0 ? "up" : "down");
           if (setHeight) {
-            Log.Info("Setting height end." CR);
-            WebSerial.println("Setting height end.");
+            logItI("Setting height end.");
             setHeight = false;
           }
         }
@@ -510,4 +701,9 @@ void loop() {
 
   move();
   mqtt_publishHeight();
+  // Publish status to Home Assistant every 60 seconds  
+  publishTopicsForHASSRepeat();
+  // RemoteDebug
+  if (debug)
+    Debug.handle();
 }

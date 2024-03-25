@@ -1,0 +1,12 @@
+{
+   "name":"Robodesk",
+   "command_topic":"home/table/cmd",
+   "state_topic":"home/table/state",
+   "unique_id":"robodesk01",
+   "device":{
+      "identifiers":[
+         "garden01ad"
+      ],
+      "name":"Garden"
+   }
+}
